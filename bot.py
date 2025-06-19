@@ -4,11 +4,15 @@ import logging
 import asyncio
 import httpx
 from datetime import datetime, timedelta
+import pytz
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urlparse, urljoin
+
+# Configuração de timezone brasileiro
+TIMEZONE_BR = pytz.timezone('America/Sao_Paulo')
 
 # Configuração de logging
 logging.basicConfig(
@@ -86,12 +90,18 @@ def limpar_historico_antigo(config_data):
     """Remove links antigos do histórico baseado na data de notificação."""
     try:
         historico = config_data.get("historico_links", {})
-        data_limite = datetime.now() - timedelta(days=DIAS_HISTORICO_LINKS)
+        data_limite = datetime.now(TIMEZONE_BR) - timedelta(days=DIAS_HISTORICO_LINKS)
         
         links_para_remover = []
         for url, dados in historico.items():
             try:
-                data_notificacao = datetime.fromisoformat(dados.get("data_notificacao", ""))
+                data_notificacao_str = dados.get("data_notificacao", "")
+                data_notificacao = datetime.fromisoformat(data_notificacao_str.replace('Z', '+00:00'))
+                if data_notificacao.tzinfo is None:
+                    data_notificacao = TIMEZONE_BR.localize(data_notificacao)
+                else:
+                    data_notificacao = data_notificacao.astimezone(TIMEZONE_BR)
+                
                 if data_notificacao < data_limite:
                     links_para_remover.append(url)
             except:
@@ -324,22 +334,28 @@ class MonitoramentoManager:
                     # Tentar extrair data de publicação de meta tags
                     data_publicacao = None
                     
-                    # Procurar por meta tags de data
+                    # Procurar por meta tags de data (melhorado para G1)
                     meta_tags_data = [
-                        'article:published_time',
-                        'datePublished',
-                        'publishdate',
-                        'date',
-                        'DC.date.issued',
-                        'publication_date'
+                        ('property', 'article:published_time'),
+                        ('name', 'datePublished'),
+                        ('property', 'datePublished'),
+                        ('name', 'publishdate'),
+                        ('property', 'publishdate'),
+                        ('name', 'date'),
+                        ('property', 'DC.date.issued'),
+                        ('name', 'publication_date'),
+                        ('property', 'article:published'),
+                        ('name', 'pubdate')
                     ]
                     
-                    for meta_name in meta_tags_data:
-                        meta_tag = soup.find('meta', {'property': meta_name}) or soup.find('meta', {'name': meta_name})
+                    for attr_type, meta_name in meta_tags_data:
+                        meta_tag = soup.find('meta', {attr_type: meta_name})
                         if meta_tag and meta_tag.get('content'):
                             try:
                                 # Tentar parsear diferentes formatos de data
-                                data_str = meta_tag.get('content')
+                                data_str = meta_tag.get('content').strip()
+                                logger.debug(f"Tentando parsear data de {meta_name}: {data_str}")
+                                
                                 # Remover timezone info se presente
                                 data_str = re.sub(r'[+-]\d{2}:\d{2}$', '', data_str)
                                 data_str = re.sub(r'Z$', '', data_str)
@@ -350,12 +366,15 @@ class MonitoramentoManager:
                                     '%Y-%m-%d %H:%M:%S',
                                     '%Y-%m-%d',
                                     '%d/%m/%Y',
-                                    '%d-%m-%Y'
+                                    '%d-%m-%Y',
+                                    '%Y/%m/%d',
+                                    '%m/%d/%Y'
                                 ]
                                 
                                 for formato in formatos:
                                     try:
                                         data_publicacao = datetime.strptime(data_str, formato).date()
+                                        logger.debug(f"Data extraída com sucesso: {data_publicacao} (formato: {formato})")
                                         break
                                     except ValueError:
                                         continue
@@ -370,20 +389,95 @@ class MonitoramentoManager:
                     # Se não encontrou data nas meta tags, tentar extrair da URL
                     if not data_publicacao:
                         data_publicacao = extrair_data_da_url(url)
+                        if data_publicacao:
+                            logger.debug(f"Data extraída da URL: {data_publicacao}")
                     
-                    # Extrair texto limpo
-                    for script in soup(["script", "style"]):
-                        script.decompose()
+                    # Se ainda não encontrou, tentar buscar no conteúdo da página
+                    if not data_publicacao:
+                        # Procurar por padrões de data no HTML
+                        texto_html = str(soup)
+                        padroes_data = [
+                            r'"datePublished":"(\d{4}-\d{2}-\d{2})',
+                            r'"publishedAt":"(\d{4}-\d{2}-\d{2})',
+                            r'data-published="(\d{4}-\d{2}-\d{2})',
+                            r'datetime="(\d{4}-\d{2}-\d{2})'
+                        ]
+                        
+                        for padrao in padroes_data:
+                            match = re.search(padrao, texto_html)
+                            if match:
+                                try:
+                                    data_str = match.group(1)
+                                    data_publicacao = datetime.strptime(data_str, '%Y-%m-%d').date()
+                                    logger.debug(f"Data extraída do HTML: {data_publicacao}")
+                                    break
+                                except:
+                                    continue
                     
-                    texto = soup.get_text()
-                    linhas = (linha.strip() for linha in texto.splitlines())
-                    chunks = (frase.strip() for linha in linhas for frase in linha.split("  "))
-                    texto_limpo = ' '.join(chunk for chunk in chunks if chunk)
+                    # Log final da data
+                    if data_publicacao:
+                        logger.info(f"📅 Data extraída: {data_publicacao}")
+                    else:
+                        logger.warning(f"📅 Não foi possível extrair data de {url}")
+                        # Para debug: assumir data de hoje se não conseguir extrair
+                        data_publicacao = datetime.now(TIMEZONE_BR).date()
+                        logger.info(f"📅 Usando data atual como fallback: {data_publicacao}")
+                    
+                    # CORREÇÃO: Extrair apenas conteúdo principal da notícia
+                    texto_limpo = ""
+                    
+                    # Tentar encontrar o conteúdo principal da notícia
+                    conteudo_principal = ""
+                    
+                    # Para G1, tentar seletores específicos do conteúdo
+                    selectors_conteudo = [
+                        'div.content-text__container',
+                        'div.mc-article-body',
+                        'div.content-text',
+                        'article',
+                        'div[data-module="ArticleBody"]',
+                        'div.content-body'
+                    ]
+                    
+                    for selector in selectors_conteudo:
+                        elementos = soup.select(selector)
+                        if elementos:
+                            for elemento in elementos:
+                                # Remover elementos indesejados (navegação, menus, etc.)
+                                for tag_indesejada in elemento.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'menu']):
+                                    tag_indesejada.decompose()
+                                conteudo_principal += elemento.get_text() + " "
+                            break
+                    
+                    # Se não encontrou conteúdo específico, usar apenas parágrafos principais
+                    if not conteudo_principal.strip():
+                        paragrafos = soup.find_all('p')
+                        # Filtrar parágrafos que provavelmente são do conteúdo principal
+                        paragrafos_principais = []
+                        for p in paragrafos:
+                            texto_p = p.get_text().strip()
+                            # Ignorar parágrafos muito curtos ou que parecem ser navegação
+                            if len(texto_p) > 30 and not any(palavra in texto_p.lower() for palavra in ['menu', 'navegação', 'editorias', 'primeira página']):
+                                paragrafos_principais.append(texto_p)
+                        conteudo_principal = ' '.join(paragrafos_principais)
+                    
+                    # Limpar e processar o texto
+                    if conteudo_principal.strip():
+                        texto_limpo = ' '.join(conteudo_principal.split()).lower()
+                    else:
+                        # Fallback: usar método antigo mas com mais filtros
+                        for script in soup(["script", "style", "nav", "header", "footer", "aside", "menu"]):
+                            script.decompose()
+                        
+                        texto = soup.get_text()
+                        linhas = (linha.strip() for linha in texto.splitlines())
+                        chunks = (frase.strip() for linha in linhas for frase in linha.split("  "))
+                        texto_limpo = ' '.join(chunk for chunk in chunks if chunk).lower()
                     
                     return {
                         'titulo': titulo,
                         'data_publicacao': data_publicacao,
-                        'texto': texto_limpo.lower(),
+                        'texto': texto_limpo,
                         'url': url
                     }
                 else:
@@ -400,7 +494,7 @@ class MonitoramentoManager:
             # Se não conseguiu extrair a data, considera como recente para não perder notícias
             return True
         
-        data_limite = datetime.now().date() - timedelta(days=DIAS_FILTRO_NOTICIAS)
+        data_limite = datetime.now(TIMEZONE_BR).date() - timedelta(days=DIAS_FILTRO_NOTICIAS)
         return data_publicacao >= data_limite
     
     def ja_foi_notificado(self, url, config_data):
@@ -413,8 +507,11 @@ class MonitoramentoManager:
         if "historico_links" not in config_data:
             config_data["historico_links"] = {}
         
+        # Usar timezone brasileiro para timestamp
+        agora_br = datetime.now(TIMEZONE_BR)
+        
         config_data["historico_links"][url] = {
-            "data_notificacao": datetime.now().isoformat(),
+            "data_notificacao": agora_br.isoformat(),
             "data_publicacao": data_publicacao.isoformat() if data_publicacao else None,
             "secao": secao
         }
@@ -443,11 +540,13 @@ class MonitoramentoManager:
             
             # Verificar se é notícia recente
             if not self.eh_noticia_recente(metadados['data_publicacao']):
-                logger.debug(f"Notícia antiga ignorada: {url_noticia}")
+                logger.debug(f"⏰ Notícia muito antiga: {metadados['data_publicacao']}")
                 return None
             
             # Verificar palavras-chave
             palavras_encontradas = await self.verificar_palavras_chave(metadados['texto'], palavras_chave)
+            logger.debug(f"🔍 Palavras testadas: {palavras_chave[:3]}... | Encontradas: {palavras_encontradas}")
+            
             if palavras_encontradas:
                 # Identificar seção
                 secao = identificar_secao_url(url_noticia)
@@ -460,7 +559,7 @@ class MonitoramentoManager:
                     'titulo': metadados['titulo'],
                     'data_publicacao': metadados['data_publicacao'],
                     'palavras': palavras_encontradas,
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.now(TIMEZONE_BR).isoformat(),
                     'fonte_nome': extrair_nome_fonte(url_noticia),
                     'secao': secao
                 }
@@ -553,7 +652,7 @@ class MonitoramentoManager:
             logger.info("✅ Nenhuma palavra-chave encontrada")
         
         # Atualizar timestamp da última verificação
-        config["ultima_verificacao"] = datetime.now().isoformat()
+        config["ultima_verificacao"] = datetime.now(TIMEZONE_BR).isoformat()
         salvar_config(config)
         
         return resultados
@@ -576,8 +675,13 @@ class MonitoramentoManager:
                     except:
                         data_publicacao_str = "Data não disponível"
                 
-                # Formatar timestamp de detecção
-                timestamp_detectado = datetime.fromisoformat(resultado['timestamp']).strftime('%d/%m/%Y às %H:%M')
+                # Formatar timestamp de detecção com timezone brasileiro
+                timestamp_detectado = datetime.fromisoformat(resultado['timestamp'].replace('Z', '+00:00'))
+                if timestamp_detectado.tzinfo is None:
+                    timestamp_detectado = TIMEZONE_BR.localize(timestamp_detectado)
+                else:
+                    timestamp_detectado = timestamp_detectado.astimezone(TIMEZONE_BR)
+                timestamp_str = timestamp_detectado.strftime('%d/%m/%Y às %H:%M')
                 
                 # Incluir seção no nome da fonte
                 fonte_com_secao = f"{resultado['fonte_nome']} - {resultado['secao']}"
@@ -588,7 +692,7 @@ class MonitoramentoManager:
                     f"🗞️ *{fonte_com_secao}*\n\n"
                     f"📰 {resultado['titulo']}\n\n"
                     f"🔗 {resultado['url']}\n\n"
-                    f"⏰ *Detectado em:* {timestamp_detectado}"
+                    f"⏰ *Detectado em:* {timestamp_str}"
                 )
                 
                 await self.bot.send_message(
@@ -860,7 +964,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ultima_str = "Nunca"
     if ultima_verificacao:
         try:
-            ultima_dt = datetime.fromisoformat(ultima_verificacao)
+            ultima_dt = datetime.fromisoformat(ultima_verificacao.replace('Z', '+00:00'))
+            if ultima_dt.tzinfo is None:
+                ultima_dt = TIMEZONE_BR.localize(ultima_dt)
+            else:
+                ultima_dt = ultima_dt.astimezone(TIMEZONE_BR)
             ultima_str = ultima_dt.strftime('%d/%m/%Y %H:%M:%S')
         except:
             ultima_str = "Erro na data"
