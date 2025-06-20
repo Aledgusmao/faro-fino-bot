@@ -1,4 +1,0 @@
-python-telegram-bot==20.7
-httpx==0.25.2
-beautifulsoup4==4.12.2
-pytz==2023.3
